@@ -2,7 +2,8 @@
 #  Lots more rtorrent management: checking up/down speeds, etc.
 #  Check seeds for torrents; retry logic? How long do we keep at a torrent?
 #  rtorrent session management: we need to be able to save/resume when machine goes down
-
+#  torrent file name and content file names can be nonconfirming in all sort of terrible ways... strategy? :O
+#  when torrent path consists of subdirectory, not sure 
 import io
 import os
 import sys
@@ -158,9 +159,8 @@ def dlogAppend ( lev, str ):
     global dlogfile
     global dloglevel
     if lev <= dloglevel and dlogfile is not None:
-        lt = datetime.datetime.now()
         try:
-            dlogfile.write( "%s %s" %  ( lt,  str.encode( 'utf-8' ) ) )
+            dlogfile.write( "%s" %  ( str.encode( 'utf-8' ) ) )
         except:
             try:
                 dlogfile.write ( "%s <* removed unprintable chars *> %s" % (lt, printable( str ) ) )
@@ -189,12 +189,15 @@ def sanitizeString ( dirty ):
     return clean
     
 def parseTorrent( torrentFile ):
-    """Return a tuple with info_hash and info for logging as a string ready for xmlrpc"""
+    """Return a tuple with info_hash, files, and printable info for logging as a string ready for xmlrpc"""
     try: 
         with open( torrentFile, "rb") as f:
             metainfo = bdecode( f.read() )
                 
         info = metainfo['info']
+
+        fils = info['files']
+        
         encodedInfo = bencode.bencode(info)
         infoHash = hashlib.sha1(encodedInfo).hexdigest().upper()
     
@@ -209,14 +212,14 @@ def parseTorrent( torrentFile ):
     
         torrentInfo = '%s\nSHA1 info_hash: %s' % (tmpStream.getvalue(), infoHash )
         
-        return ( infoHash, torrentInfo )
+        return ( infoHash, fils, torrentInfo )
 
     except:
         return None        
 
 
 
-def retrieveTorrent ( torrentFile, infoHash, torrentDir ):
+def retrieveTorrent ( torrentFile, infoHash, filelist, torrentDir ):
     global TORRENT_PATH
     
     dlog (1, 'Retrieving %s into %s' % ( torrentFile, torrentDir) )
@@ -279,7 +282,8 @@ def retrieveTorrent ( torrentFile, infoHash, torrentDir ):
     # wait for completion...
     finished = False
     # TODO monitor for other changes of state...!
-    dlogAppend (1, 'Downloading %s MB' % dlsizeMB )
+    lt = datetime.datetime.now()    
+    dlogAppend (1, '%s Downloading %s MB' % (lt, dlsizeMB ) )
     while finished is False:
         time.sleep(60)
         comlist = ['rtxmlrpc', 'd.get_complete', infoHash ]
@@ -289,13 +293,30 @@ def retrieveTorrent ( torrentFile, infoHash, torrentDir ):
         if comCode == 0 and exitCode == '1':
             finished = True
         dlogAppend (1, '.' )
-
             
     dlog (1, '\nSUCCESS: retrieved %s into %s' % (torrentFile, torrentDir ) )
 
+    # remove the torrent from seeding/download list
+    # note that rtorrent deleted the 'tied' .torrent file, that's why we work on a copy
     comlist = ['rtxmlrpc', 'd.erase', infoHash ]
     ret = shellCommand (comlist)
 
+    # write the list of retrieved files to .torrentcontents
+    # TODO: could query rtorrent via d.get_size_files, followed by iteration using f.get_path
+    #  but should we? In theory that would only rely on rtorrent's own parsing of the same data
+    contFile = '%s/%scontents' % ( torentDir, torrentFile ) 
+    with codecs.open( contFile, encoding='utf-8', mode=logmode ) as cfile:
+        for aFile in filelist:
+            # path is array expressing a dir path, last of which is fn
+            #  c.f. http://www.bittorrent.org/beps/bep_0003.html
+            fn = ''.join( aFile['path'] )
+            fs = aFile['length']
+            cfile.write ('%s,%s\n' % (fn, fs) )
+            
+    # finally, move the original torrent file into the downloaded directory
+    comlist = ['mv', torrentFile, ('%s/.' % torrentDir ) ]
+    ret = shellCommand (comlist)
+    
     return 0    
     
 
@@ -312,7 +333,11 @@ def rtorrentUp():
     ret = shellCommand( ['test','-S',SCGI_SOCKET] )
     if ret[0] == 1:
         return True
-    # rtorrent not up on socket, try to bring it up...
+    dlog( 1, 'rtorrent not detected on socket, trying to start...' )
+    ret = shellCommand( ['rtorrent'] )
+    time.sleep(1)
+    ret = shellCommand( ['test','-S',SCGI_SOCKET] )
+    return ( ret[0] == 1 )    
     
 def tempDirForTorrent( infoHash ):
     global TEMP_DIR
@@ -410,13 +435,14 @@ def main(argv=None):
                 return 1 
 
             infoHash = tup[0]
-            torrentInfo = tup[1]
+            filelist = tup[1]
+            torrentInfo = tup[2]
 
             if os.access( TEMP_DIR, os.F_OK ) is False:
                 os.mkdir( TEMP_DIR )
             torrentDir = tempDirForTorrent( infoHash )                           
 
-            res = retrieveTorrent ( torrentFile, infoHash, torrentDir )
+            res = retrieveTorrent ( torrentFile, infoHash, filelist, torrentDir )
             if res == 0:
                 dlog(1, "btget: (0) retrieved %s" % torrentFile)
                 return 0
