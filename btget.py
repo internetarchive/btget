@@ -4,6 +4,9 @@
 #  rtorrent session management: we need to be able to save/resume when machine goes down
 #  torrent file name and content file names can be nonconfirming in all sort of terrible ways... strategy? :O
 #  when torrent path consists of subdirectory, not sure 
+#  Figure out how to start rtorrent when it's not up
+#       search for: startRtorrentOurselves
+
 import io
 import os
 import sys
@@ -258,7 +261,7 @@ def retrieveTorrent ( torrentFile, infoHash, filelist, torrentDir ):
     comCode = ret[0]
     exitCode = ret[1].strip()
     if comCode != 0 or exitCode != '0':
-        dlog (1, 'FAILED: could not load %s, exitcode %s ( %s, %s)' % (torrentFile, exitCode, ret[1], ret[2] ) )
+        dlog (1, 'FAILED: could not load %s, exitcode %s\n%s\n%s' % (torrentFile, comCode, ret[1], ret[2] ) )
         return 1       
           
     comlist = ['rtxmlrpc', 'd.start', infoHash ]
@@ -266,7 +269,7 @@ def retrieveTorrent ( torrentFile, infoHash, filelist, torrentDir ):
     comCode = ret[0]
     exitCode = ret[1].strip()
     if comCode != 0 or exitCode != '0':
-        dlog (1, 'FAILED: did not start %s, exitcode %s ( %s, %s)' % (torrentFile, exitCode, ret[1], ret[2] ) )
+        dlog (1, 'FAILED: did not start %s, exitcode %s\n%s\n%s' % (torrentFile, comCode, ret[1], ret[2] ) )
         return 1        
     
     comlist = ['rtxmlrpc', 'd.get_size_bytes', infoHash ]
@@ -282,8 +285,7 @@ def retrieveTorrent ( torrentFile, infoHash, filelist, torrentDir ):
     # wait for completion...
     finished = False
     # TODO monitor for other changes of state...!
-    lt = datetime.datetime.now()    
-    dlogAppend (1, '%s Downloading %s MB' % (lt, dlsizeMB ) )
+    dlogAppend (1, 'Downloading %s MB' % dlsizeMB )
     while finished is False:
         time.sleep(60)
         comlist = ['rtxmlrpc', 'd.get_complete', infoHash ]
@@ -304,12 +306,12 @@ def retrieveTorrent ( torrentFile, infoHash, filelist, torrentDir ):
     # write the list of retrieved files to .torrentcontents
     # TODO: could query rtorrent via d.get_size_files, followed by iteration using f.get_path
     #  but should we? In theory that would only rely on rtorrent's own parsing of the same data
-    contFile = '%s/%scontents' % ( torentDir, torrentFile ) 
-    with codecs.open( contFile, encoding='utf-8', mode=logmode ) as cfile:
+    contFile = '%s/%scontents' % ( torrentDir, torrentFile ) 
+    with codecs.open( contFile, encoding='utf-8', mode="w" ) as cfile:
         for aFile in filelist:
             # path is array expressing a dir path, last of which is fn
             #  c.f. http://www.bittorrent.org/beps/bep_0003.html
-            fn = ''.join( aFile['path'] )
+            fn = '/'.join( aFile['path'] )
             fs = aFile['length']
             cfile.write ('%s,%s\n' % (fn, fs) )
             
@@ -320,7 +322,7 @@ def retrieveTorrent ( torrentFile, infoHash, filelist, torrentDir ):
     return 0    
     
 
-def shellCommand (comlist):    
+def shellCommand ( comlist ):    
     p = subprocess.Popen( comlist, stderr = subprocess.STDOUT, stdout = subprocess.PIPE )
     (res, err) = p.communicate()
     exitcode = p.wait()
@@ -329,15 +331,24 @@ def shellCommand (comlist):
     return ret
     
 def rtorrentUp():
-    global SCGI_SOCKET
-    ret = shellCommand( ['test','-S',SCGI_SOCKET] )
-    if ret[0] == 1:
+    # global SCGI_SOCKET currently hard coded thanks to subprocess arg headaches
+    
+    startRtorrentOurselves = False
+    
+    ret = shellCommand( ['./testsocket'] )
+    sockoutput = ret[1].strip()
+    print SCGI_SOCKET, ret, sockoutput
+    if sockoutput == '0':
         return True
-    dlog( 1, 'rtorrent not detected on socket, trying to start...' )
-    ret = shellCommand( ['rtorrent'] )
-    time.sleep(1)
-    ret = shellCommand( ['test','-S',SCGI_SOCKET] )
-    return ( ret[0] == 1 )    
+    if startRtorrentOurselves is True:
+        dlog( 1, 'rtorrent not detected on socket, trying to start...' )
+        shellCommand( ['rtorrent', '&'] )
+        time.sleep(1)
+        ret = shellCommand( ['./testsocket'] )
+        sockoutput = ret[1].strip()
+        return ( sockoutput == '0' )
+    else:
+        return False
     
 def tempDirForTorrent( infoHash ):
     global TEMP_DIR
@@ -367,7 +378,7 @@ def main(argv=None):
     
     sout = False    
         
-    # TODO read this out of an .ini
+    # TODO read this out of an .ini shared by testsocket
     SCGI_SOCKET = '~/torrent/.rtorrent/rpc.socket'
     TEMP_DIR = '/home/ximm/projects/bitty/tmp'
     TORRENT_PATH = '/home/ximm/projects/bitty'
