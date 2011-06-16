@@ -1,0 +1,1 @@
+btget is a Python convenience interface for retrieving torrent files. All that is required is btget <torrentfile>... assuming rtorrent is available and communicating on a dedicated socket, through which it receives xmlrpc commands. Pyroscope is required to provide rtxmlrpc.
