@@ -218,15 +218,17 @@ def parseTorrent( torrentFile ):
         pprint.pprint ( metainfo, stream=tmpStream, indent=4 )
     
         torrentInfo = '%s\nSHA1 info_hash: %s' % (tmpStream.getvalue(), infoHash )
+
+        torrentName = info['name']
         
-        return ( infoHash, fils, torrentInfo )
+        return ( torrentName, infoHash, fils, torrentInfo )
 
     except:
         return None        
 
 
 
-def retrieveTorrent ( torrentPath, torrentFile, infoHash, filelist, torrentDir ):
+def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist, torrentDir ):
     dlog (1, 'Retrieving %s into %s' % ( torrentPath, torrentDir) )
     
     # TODO: check overall torrent status:
@@ -267,7 +269,7 @@ def retrieveTorrent ( torrentPath, torrentFile, infoHash, filelist, torrentDir )
         # write the infohash for the file
         hashFile = '%s/%shash' % ( torrentDir, torrentFile ) 
         with codecs.open( hashFile, encoding='utf-8', mode="w" ) as cfile:
-            cfile.write('%s\n' % infoHash)
+            cfile.write('%s\n%s\n' % ( infoHash, torrentName ) )
               
         # write the list of retrieved files to .torrentcontents
         contFile = '%s/%scontents' % ( torrentDir, torrentFile ) 
@@ -295,7 +297,7 @@ def retrieveTorrent ( torrentPath, torrentFile, infoHash, filelist, torrentDir )
             finished = True
         comCode, res, err = transmissionTorrentState ( infoHash )
         state = findState( res )
-        if state == 'Idle':
+        if state == 'Idle' or state == 'Seeding':
             perc = findVal( 'Percent Done: ', res )
             if perc == '100%':
                 dlog( 1, 'Download completed' )
@@ -493,7 +495,7 @@ def main(argv=None):
             dlog(0, "btget: (1) problem with torrent file %s" % torrentPath)
             return 1
         else:
-            infoHash, filelist, torrentInfo = tup
+            torrentName, infoHash, filelist, torrentInfo = tup
             
             if makeTempDir is True:
                 # default to store torrent in TEMP_DIR/infoHash/ 
@@ -507,7 +509,7 @@ def main(argv=None):
                     return 1
                 torrentDir = TEMP_DIR
             
-            res = retrieveTorrent ( torrentPath, torrentFile, infoHash, filelist, torrentDir )
+            res = retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist, torrentDir )
             if res == 0:
                 dlog(1, "btget: (0) retrieved %s" % torrentFile)
                 return 0
