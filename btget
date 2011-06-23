@@ -1,0 +1,525 @@
+#!/usr/bin/env python
+
+# requires: transmission-daemon and transmission-remote
+# assumes transmission-daemon is listening for rpc on host port 9091
+
+# usage:
+#   btget filename.torrent -dir=tempdir
+# note: tempdir must have ugo+w so debian-transmission can write to it
+
+# TODO:
+#  Add mutable transmission-remote rpc authentication credentials and port 
+#  Add seed/leech ratio management so we maintain at least parity
+#   checking up/down speeds, etc.
+#  Check seeds for torrents; retry logic? How long do we keep at a torrent?
+#  session management: we need to be able to save/resume when machine goes down
+#  torrent file name and content file names can be nonconfirming in all sort of terrible ways... strategy? :O
+#  when torrent path consists of subdirectory, not sure 
+# NOTES:
+
+import io
+import os
+import sys
+import shutil
+import string
+import time
+import httplib
+from urlparse import urlparse 
+import urllib2
+import subprocess
+import datetime
+import codecs
+import re
+import bencode
+import pprint
+import urllib
+import hashlib
+import StringIO
+
+try:
+    import psyco # Optional, 2.5x improvement in speed
+    psyco.full()
+except ImportError:
+    pass
+
+decimal_match = re.compile('\d')
+
+def bdecode(data):
+    '''Main function to decode bencoded data'''
+    chunks = list(data)
+    chunks.reverse()
+    root = _dechunk(chunks)
+    return root
+
+def _dechunk(chunks):
+    item = chunks.pop()
+
+    if item == 'd': 
+        item = chunks.pop()
+        hash = {}
+        while item != 'e':
+            chunks.append(item)
+            key = _dechunk(chunks)
+            hash[key] = _dechunk(chunks)
+            item = chunks.pop()
+        return hash
+    elif item == 'l':
+        item = chunks.pop()
+        list = []
+        while item != 'e':
+            chunks.append(item)
+            list.append(_dechunk(chunks))
+            item = chunks.pop()
+        return list
+    elif item == 'i':
+        item = chunks.pop()
+        num = ''
+        while item != 'e':
+            num  += item
+            item = chunks.pop()
+        return int(num)
+    elif decimal_match.search(item):
+        num = ''
+        while decimal_match.search(item):
+            num += item
+            item = chunks.pop()
+        line = ''
+        for i in range(int(num)):
+            line += chunks.pop()
+        return line
+
+def pingTracker ( ahash ):
+    # return len( ahash)
+    #tracker = "http://inferno.demonoid.me:3393/"
+    tracker = "http://10.rarbg.com/"
+    surl = tracker + ("scrape?info_hash=%s" % ahash )
+    curllist = ['curl', '-s', surl]
+    p = subprocess.Popen( curllist, stderr = subprocess.STDOUT, stdout = subprocess.PIPE )
+    (res, err) = p.communicate()
+    exitcode = p.wait()
+    if exitcode == 0:
+        return res
+    else:
+        return ' - failed - '
+
+def plingTracker ( hashlist):
+    idx = 1
+    for ahash in hashlist:
+        rep = pingTracker( ahash )
+        print( '[%s] %s : %s ' % ( str(idx).zfill(3), ahash, rep ) )
+        idx = idx + 1
+
+
+def ByteToHex( byteStr ):
+    """
+    Convert a byte string to it's hex string representation e.g. for output.
+    """
+    
+    # Uses list comprehension which is a fractionally faster implementation than
+    # the alternative, more readable, implementation below
+    #   
+    #    hex = []
+    #    for aChar in byteStr:
+    #        hex.append( "%02X " % ord( aChar ) )
+    #
+    #    return ''.join( hex ).strip()        
+
+    return ''.join( [ "%02X" % ord( x ) for x in byteStr ] ).lower()
+
+def HexToByte( hexStr ):
+    """
+    Convert a string hex byte values into a byte string. The Hex Byte values may
+    or may not be space separated.
+    """
+    # The list comprehension implementation is fractionally slower in this case    
+    #
+    #    hexStr = ''.join( hexStr.split(" ") )
+    #    return ''.join( ["%c" % chr( int ( hexStr[i:i+2],16 ) ) \
+    #                                   for i in range(0, len( hexStr ), 2) ] )
+ 
+    bytes = []
+
+    hexStr = ''.join( hexStr.split(" ").upper() )
+
+    for i in range(0, len(hexStr), 2):
+        bytes.append( chr( int (hexStr[i:i+2], 16 ) ) )
+
+    return ''.join( bytes )
+
+# Logging   
+            
+def dlog ( lev, str ):
+    global sout
+    global dlogfile
+    global dloglevel
+    if lev <= dloglevel and dlogfile is not None:
+        lt = datetime.datetime.now()
+        try:
+            dlogfile.write( "%s %s\n" %  ( lt,  str.encode( 'utf-8' ) ) )
+        except:
+            try:
+                dlogfile.write ( "%s <* removed unprintable chars *> %s\n" % (lt, printable( str ) ) )
+            except:
+                dlogfile.write ( "%s <* unprintable *>\n" % lt )
+        if sout is True:
+            print str
+            sys.stdout.flush()
+        dlogfile.flush()
+    return
+
+def dlogAppend ( lev, str ):
+    global sout
+    global dlogfile
+    global dloglevel
+    if lev <= dloglevel and dlogfile is not None:
+        try:
+            dlogfile.write( "%s" %  ( str.encode( 'utf-8' ) ) )
+        except:
+            try:
+                dlogfile.write ( "%s <* removed unprintable chars *> %s" % (lt, printable( str ) ) )
+            except:
+                dlogfile.write( "%s <* unprintable *>\n" % lt )
+        if sout is True:
+            print str,
+            sys.stdout.flush()
+        dlogfile.flush()
+    return
+
+
+def printable ( dirty ):
+    # eliminate non-printable chars
+    clean = "".join(i for i in dirty if ord(i) < 128)
+#    clean = ''.join([char for char in dirty if isascii(char)])
+#    return ''.join([char for char in clean if isprint(char)])
+    return clean
+
+
+    
+def parseTorrent( torrentFile ):
+    """Return a tuple with info_hash, files, and printable info for logging as a string ready for xmlrpc"""
+    try: 
+        with open( torrentFile, "rb") as f:
+            metainfo = bdecode( f.read() )
+                
+        info = metainfo['info']
+
+        fils = info['files']
+        
+        encodedInfo = bencode.bencode(info)
+        infoHash = hashlib.sha1(encodedInfo).hexdigest().upper()
+    
+        tmpStream = StringIO.StringIO()        
+    
+        pieces = StringIO.StringIO(info['pieces'])
+        hashes = info['pieces'] 
+        numhashes = len(hashes) / 20    
+        info['pieces'] = ' -- hashes -- '   
+    
+        pprint.pprint ( metainfo, stream=tmpStream, indent=4 )
+    
+        torrentInfo = '%s\nSHA1 info_hash: %s' % (tmpStream.getvalue(), infoHash )
+        
+        return ( infoHash, fils, torrentInfo )
+
+    except:
+        return None        
+
+
+
+def retrieveTorrent ( torrentPath, torrentFile, infoHash, filelist, torrentDir ):
+    dlog (1, 'Retrieving %s into %s' % ( torrentPath, torrentDir) )
+    
+    # TODO: check overall torrent status:
+    #   seeding OK? up/download speeds OK? etc.
+
+    startTorrent = True
+
+    # check whether we've retrieved/started this torrent already
+    comCode, res, err = transmissionTorrentState ( infoHash )
+    state = findState ( res )
+    if state == 'Idle':
+        dlog (1, 'NOSTART: torrent already downloaded' )
+        startTorrent = False
+    elif state == 'Downloading':
+        dlog (1, 'NOSTART: torrent downloading now' )
+        startTorrent = False
+    elif state == 'Stopped':
+        dlog (1, 'RESTARTING: torrent stopped, attempting to restart' )
+    elif state != '(None)':
+        dlog (1, 'FAILED: torrent exists in unhandled state ( %s )' % state )
+        return 1         
+    
+    if startTorrent is True:    
+        # set the directory in which the torrent will download
+        # note that each torrent goes into its own subdirectory
+        comlist = ['--download-dir', torrentDir ]
+        ret = transmissionCommand (comlist)
+        
+        # torrent path/fn provided must be fully qualified if not in ~
+        comlist = ['--add', torrentPath ]
+        comCode, res, err = transmissionCommand (comlist)
+        resp = findResp ( res )
+        if resp != '"success"' and resp != '"duplicate torrent"':
+            dlog (1, 'FAILED: could not load %s, exitcode %s\n%s\n%s' % (torrentPath, comCode, res, err ) )
+            return 1       
+
+        # TODO: use Hank's technique for adding to metadata in Torrent.php
+        # write the infohash for the file
+        hashFile = '%s/%shash' % ( torrentDir, torrentFile ) 
+        with codecs.open( hashFile, encoding='utf-8', mode="w" ) as cfile:
+            cfile.write('%s\n' % infoHash)
+              
+        # write the list of retrieved files to .torrentcontents
+        contFile = '%s/%scontents' % ( torrentDir, torrentFile ) 
+        dlsize = 0
+        with codecs.open( contFile, encoding='utf-8', mode="w" ) as cfile:
+            for aFile in filelist:
+                # path is array expressing a dir path, last of which is fn
+                #  c.f. http://www.bittorrent.org/beps/bep_0003.html
+                fn = '/'.join( aFile['path'] )
+                fs = aFile['length']
+                dlsize = dlsize + int(fs)
+                cfile.write ('%s,%s\n' % (fn, fs) )
+        dlsizeK = dlsize / 1024
+        dlsizeMB = dlsizeK / 1024
+        dlog (1, 'Downloading %s MB' % dlsizeMB )    
+
+    # wait for completion...
+    # TODO build a better state machine
+    finished = False
+    success = False
+    mins = 0
+    while finished is False:
+        if giveUpP ( infoHash, mins ) is True:
+            dlog( 1, '\nDownload abandoned after %s minutes.' % min )
+            finished = True
+        comCode, res, err = transmissionTorrentState ( infoHash )
+        state = findState( res )
+        if state == 'Idle':
+            perc = findVal( 'Percent Done: ', res )
+            if perc == '100%':
+                dlog( 1, 'Download completed' )
+                finished = True
+                success = True                    
+        elif state == 'Stopped':
+            perc = findVal( 'Percent Done: ', res )
+            error = findError( res )
+            dlog( 1, 'Download stopped at %s complete' % perc )
+            if perc == '100%':
+                success = True
+            if error != 'None':
+                dlog( 1, 'ERROR: %s' % error )                
+            finished = True
+        else:
+            time.sleep(60)
+            mins = mins + 1
+            if mins < 15:
+                dlog (1, '.')
+            else:
+                if mins < 60 and mins % 5 == 0:
+                    dlog (1, '..' )            
+                else:
+                    if mins < (60 * 24) and mins % 60 == 0:
+                        dlog (1, '...' )    
+                    else:
+                        if mins % (60 * 24) == 0:
+                            dlog (1, '....' )
+
+    # remove the torrent from seeding/download list
+    # note that rtorrent deleted the 'tied' .torrent file, that's why we work on a copy
+    # TODO: maintain seeding ratio by keeping alive until ratio reached
+    #  issue: what if no one is interested...? :P  
+    comlist = ['--torrent', infoHash, '--remove' ]
+    comCode, res, err = transmissionCommand (comlist)
+    
+    # NOTE: now doing this in Torrent.php
+    # finally, move the original torrent file into the downloaded directory
+    # comlist = ['mv', torrentPath, ('%s.' % torrentDir ) ]
+    # ret = shellCommand (comlist)
+    
+    if success is True:
+        return 0    
+    else:
+        return 1
+
+# Helpers
+
+def giveUpP ( infoHash, min):
+    # TODO: check download seeders here? giveUp can manage its own state...
+    # for now just give up after a week... :P
+    if min > (60 * 24 * 7):
+        return True
+    else:
+        return False
+        
+def findState ( stringOfLines ):
+    return findVal ( 'State: ', stringOfLines )
+
+def findResp ( stringOfLines):
+    return findVal ( 'localhost:9091 responded: ', stringOfLines )
+
+def findError ( stringOfLines ):
+    return findVal ( 'Error: ', stringOfLines )
+        
+def findVal ( keytext, stringOfLines ):
+    try:
+        theLine =  [l for l in stringOfLines.splitlines() if (keytext in l)][-1]
+        theVal = theLine.split( keytext )[-1].strip()
+        return theVal
+    except:
+        return '(None)'
+
+def transmissionTorrentState ( infoHash ):
+    comlist = [ '--torrent', infoHash, '--info' ]
+    return transmissionCommand ( comlist )
+        
+def transmissionCommand ( comlist ):
+    # TODO:
+    # credentials are currently hardcoded
+    ourlist = [ 'transmission-remote',
+                '-n',
+                'transmission:' ]
+
+    ourlist.extend( comlist )
+    return shellCommand ( ourlist )
+
+def shellCommand ( comlist ):
+    comstring = ' '.join( comlist )
+    dlog( 2, comstring )
+    p = subprocess.Popen( comlist, stderr = subprocess.STDOUT, stdout = subprocess.PIPE )
+    (res, err) = p.communicate()
+    exitcode = p.wait()
+    ret = (exitcode, res, err)
+    return ret
+        
+def tempDirForTorrent( infoHash ):
+    global TEMP_DIR
+    
+    torrentDir = '%s/%s/' % (TEMP_DIR, infoHash )
+    if os.access( torrentDir, os.F_OK ) is False:
+        os.mkdir( torrentDir )
+        dlog( 2, 'Making item directory %s' % torrentDir )
+    else:
+        dlog( 2, 'Found existing item directory %s' % torrentDir )
+    return torrentDir
+
+
+    
+# Remember the Main
+
+
+
+def main(argv=None):
+
+    global verbose
+    global dlogfile         # [verbose] logging for btget
+    global retlogfile       # retry log in CSV form
+    global dloglevel        # for our own logging only; 1 = terse, 2 = verbose, 3 = debugging
+
+    global sout             # dlog prints to standard out as well
+
+    global TEMP_DIR
+    global TORRENT_PATH 
+    
+    sout = False    
+        
+    # TODO read this out of an .ini
+    TORRENT_PATH = '/home/ximm/projects/bitty'
+    DEFAULT_TEMP_DIR = '/home/ximm/projects/bitty/tmp'
+    
+    if argv is None:
+        argv = sys.argv
+
+    torrentFile = ''
+    
+    dryrun = False
+    verbose = False
+    debug = False
+
+    makeTempDir = True
+    TEMP_DIR = DEFAULT_TEMP_DIR    
+    logdir = "/home/ximm/projects/bitty/bitlogs/"
+    
+    dlfn = None
+    
+    logmode = "a"
+    
+    for anArg in argv:
+        if anArg[0] is "-":
+            qual = anArg[1:len(anArg)]
+            if qual == "dry":
+                dryrun = True
+            elif qual == "debug":
+                debug = True
+            elif qual == "verbose":
+                verbose = True
+            elif qual == "stdout":
+                sout = True
+            elif "dir=" in qual:
+                makeTempDir = False
+                TEMP_DIR = qual.split("dir=")[-1]
+                if TEMP_DIR[-1] != "/":
+                    TEMP_DIR = TEMP_DIR + "/"
+                # logdir = TEMP_DIR                    
+            elif "log=" in qual:
+                dlfn = logdir + qual.split("log=")[-1]
+                logmode = "a"
+        else:
+            torrentPath = anArg
+            if '/' in torrentPath:
+                torrentFile = torrentPath.split('/')[-1]
+            else:                
+                torrentFile = torrentPath
+
+    if dlfn is None:
+        dlfn = logdir + torrentFile + '.log'
+    
+    if verbose is True:
+        dloglevel = 2
+    else:
+        dloglevel = 1
+    
+    if debug is True:
+        dlogLevel = 3
+    
+    with codecs.open( dlfn, encoding='utf-8', mode=logmode ) as dlogfile:
+        if torrentFile is None:
+            dlog(0, 'btget: (2) no torrent file specified, aborting')
+            print 'btget: (2) no torrent file specified, aborting'
+            print 'Usage: btget torrentfile [-verbose] [-log=logfile] [-verbose] [-stdout]'  
+            return 2
+        tup = parseTorrent ( torrentFile ) # returns none on Fails        
+        if tup is None:
+            dlog(0, "btget: (1) problem with torrent file %s" % torrentPath)
+            return 1
+        else:
+            infoHash, filelist, torrentInfo = tup
+            
+            if makeTempDir is True:
+                # default to store torrent in TEMP_DIR/infoHash/ 
+                if os.access( TEMP_DIR, os.F_OK ) is False:
+                    os.mkdir( TEMP_DIR ) 
+                torrentDir = tempDirForTorrent( infoHash )                   
+            else:
+                # unless one is passed in
+                if os.access( TEMP_DIR, os.F_OK ) is False:
+                    dlog(0, "btget: (1) directory does not exist %s" % TEMP_DIR)
+                    return 1
+                torrentDir = TEMP_DIR
+            
+            res = retrieveTorrent ( torrentPath, torrentFile, infoHash, filelist, torrentDir )
+            if res == 0:
+                dlog(1, "btget: (0) retrieved %s" % torrentFile)
+                return 0
+            elif res == 2:
+                dlog(0, "btget: (1) problem with torrent file %s" % torrentFile)
+                return 1
+            elif res == 1:
+                dlog(0, "btget: (1) failed trying to retrieve %s" % torrentFile)
+                return 1
+            else:
+                dlog(0, "btget: (1) unknown failure retrieving %s" % torrentFile)
+                return 1
+                        
+if __name__ == "__main__":
+    sys.exit(main())
