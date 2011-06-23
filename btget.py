@@ -1,4 +1,7 @@
+#!/usr/bin/env python
+
 # TODO:
+#  Add seed/leech ratio management so we maintain at least parity
 #  Lots more rtorrent management: checking up/down speeds, etc.
 #  Check seeds for torrents; retry logic? How long do we keep at a torrent?
 #  rtorrent session management: we need to be able to save/resume when machine goes down
@@ -6,6 +9,19 @@
 #  when torrent path consists of subdirectory, not sure 
 #  Figure out how to start rtorrent when it's not up
 #       search for: startRtorrentOurselves
+# NOTE:
+#  Requires rtorrent to be compiled with XMLRPC control options enabled
+#  Requires Pyroscope (Python module for controlling rtorrent) for 'rtxmlrpc'
+#   Pyroscope must be available in path (e.g. ~/bin), and configured
+#   as described here: 
+#       http://code.google.com/p/pyroscope/wiki/UserConfiguration
+#   This involves changes to .rtorrentrc, running pyroadmin --create-config,
+#   and editing config.ini for Pyroscope. 
+#  Care must be taken to define the socket used for XMLRPC:
+#   SCGI_SOCKET as defined here and in .rtorrentrc
+#  Currently uses Pyrocore via command line subprocess calls; but could be
+#   integrated directly:
+#       http://code.google.com/p/pyroscope/wiki/WriteYourOwnScripts
 
 import io
 import os
@@ -337,7 +353,7 @@ def rtorrentUp():
     
     ret = shellCommand( ['./testsocket'] )
     sockoutput = ret[1].strip()
-    print SCGI_SOCKET, ret, sockoutput
+    # print SCGI_SOCKET, ret, sockoutput
     if sockoutput == '0':
         return True
     if startRtorrentOurselves is True:
@@ -380,8 +396,8 @@ def main(argv=None):
         
     # TODO read this out of an .ini shared by testsocket
     SCGI_SOCKET = '~/torrent/.rtorrent/rpc.socket'
-    TEMP_DIR = '/home/ximm/projects/bitty/tmp'
     TORRENT_PATH = '/home/ximm/projects/bitty'
+    DEFAULT_TEMP_DIR = '/home/ximm/projects/bitty/tmp'
     
     if argv is None:
         argv = sys.argv
@@ -391,9 +407,11 @@ def main(argv=None):
     dryrun = False
     verbose = False
     debug = False
-    retry = False
-    
+
+    makeTempDir = True
+    TEMP_DIR = DEFAULT_TEMP_DIR    
     logdir = "./bitlogs/"
+    
     dlfn = None
     
     logmode = "a"
@@ -409,8 +427,12 @@ def main(argv=None):
                 verbose = True
             elif qual == "stdout":
                 sout = True
-            elif "retry=" in qual:
-                retry = qual.split("retry=")[-1]
+            elif "dir=" in qual:
+                makeTempDir = False
+                TEMP_DIR = qual.split("dir=")[-1]
+                if TEMP_DIR[-1] != "/":
+                    TEMP_DIR = TEMP_DIR + "/"
+                logdir = TEMP_DIR                    
             elif "log=" in qual:
                 dlfn = logdir + qual.split("log=")[-1]
                 logmode = "a"
@@ -442,17 +464,23 @@ def main(argv=None):
             # verify rtorrent is up and running (with xmlrpc suppor via pyroscope)
             if rtorrentUp() is False:
                 dlog(1, "btget: (1) rtorrent not present on %s" % SCGI_SOCKET )
-                dlog(1, "NOTE: this script requires rtorrent and pyroscope support for rtxmlrpc control." )
+                dlog(1, "Dependency: this script requires rtorrent and pyroscope support for rtxmlrpc control." )
                 return 1 
 
-            infoHash = tup[0]
-            filelist = tup[1]
-            torrentInfo = tup[2]
+            infoHash, filelist, torrentInfo = tup
 
-            if os.access( TEMP_DIR, os.F_OK ) is False:
-                os.mkdir( TEMP_DIR )
-            torrentDir = tempDirForTorrent( infoHash )                           
-
+            if makeTempDir is True:
+                # default to store torrent in TEMP_DIR/infoHash/ 
+                if os.access( TEMP_DIR, os.F_OK ) is False:
+                    os.mkdir( TEMP_DIR ) 
+                torrentDir = tempDirForTorrent( infoHash )                   
+            else:
+                # unless one is passed in
+                if os.access( TEMP_DIR, os.F_OK ) is False:
+                    dlog(0, "btget: (1) directory does not exist %s" % TEMP_DIR)
+                    return 1
+                torrentDir = TEMP_DIR
+            
             res = retrieveTorrent ( torrentFile, infoHash, filelist, torrentDir )
             if res == 0:
                 dlog(1, "btget: (0) retrieved %s" % torrentFile)
