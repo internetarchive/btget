@@ -23,47 +23,79 @@ class Torrent extends Module
     //                     to create (will later be rm'd automatically)
 
     // REQUIRES:
-    //  transmission-daemon   configuration: listening on default port 9091 for rpc from transmission-remote
+    //  transmission-daemon   configuration: listening on default port 9091 for rpc from transmission-remote CLI
     //  transmission-remote   
     
     // OUTPUTS:
     //   .torrentcontents   comma delimited manifest of files in .torrent:  filename,size in bytes 
-    //   .torrenthash       one-line file containing the infohash of the .torrent
+    //   torrent contents 
     
     // TODO:
-    //   check for abusive filenames (containing illegal characters to prevent exploits)
+    //   check for non-conforming filenames (e.g. illegal characters leading to exploits)
     
     // NOTES:
+    //   currently assumes one torrent per item, as with scanned books (but what about .torrents full of .torrents?)
     //   currently using transmission-daemon's whitelist for IP ranges from which it accepts control
     //   currently moving .torrent.log file containing output of btget, could discard, or is it of historic interest?
     
-    Util::cmd('./btget -stdout '.Util::esc($outFile).' -dir='.Util::esc($this->tmp), 'PRINT');    
-    Util::cmd('mv '.Util::esc(($this->tmp).'* '.Util::esc($this->itemDir).'.', 'PRINT');    
-    // Assume this is unnecessary: 
-    // Util::cmd('mv '.Util::esc(($this->sourceFile).'* '.Util::esc($this->itemDir).'.', 'PRINT');
-        
-    $manifest =  $this->sourceFile . "contents" ;
-    if (file_exists($outFile)) {
-        $man_handle = fopen($manifest, "rb");
-        while (!feof($file_handle) ) {
-            $line_of_text = fgets($man_handle);
-            $parts = explode(",", $line_of_text);
-            $outFile = $parts[0];               
-            // Question: can FormatGetter handle a path if the torrent had a tree?
-            // Currently the manifest includes the path, not just filenames
-            if (file_exists($outFile)) {
-                $fg = new FormatGetter;
+    // transmission-daemon needs write permission, it runs under debian-transmission by default :P
+    Util::cmd('chmod ugo+w '.Util::esc($this->tmp), 'PRINT');    
+    
+    // TODO: move script into petabox bin basket 
+    Util::cmd('/home/ximm/projects/bitty/btget -stdout '.Util::esc($this->sourceFile).' -dir='.Util::esc($this->tmp), 'PRINT');   
+
+    // seize ownership of downloaded files; may not be necessary in production environment, not sure what permissions 
+    // derive.php is executed with
+    Util::cmd('sudo chown -R ximm '.Util::esc($this->tmp), 'PRINT');        
+    Util::cmd('sudo chmod ugo+w '.Util::esc($this->tmp).'*', 'PRINT');
+    
+    // in addition to the manifest, I generate a disposable helper file including:
+    //  (a) the SHA1 infohash fingerprint for the torrent; and 
+    //  (b) the torrent name field from its bencoded info, which == the directory name created by transmission-daemon
+    $targetHashFile = $this->tmp.$this->shortName($this->sourceFile).'hash';        
+    if (file_exists($targetHashFile)) {
+        $lines = file($targetHashFile);
+        $torrentHash = strtok($lines[0], "\n");
+        $torrentName = strtok($lines[1], "\n");
+    } else {
+        Util::cmd('echo MISSING HASH FILE:'. Util::esc($targetHashFile), 'PRINT');
+    }
+    
+    // torrent contents are in $this->tmp/$torrentName/... while moving eliminate the intermediate dir $torrentName
+    $contentPath = $this->tmp.$torrentName;    
+    Util::cmd('cp -r '.Util::esc($contentPath).'/* '.Util::esc($this->itemDir), 'PRINT');    
+    Util::cmd('rm -rf '.Util::esc($contentPath), 'PRINT');    
+    
+    // move the generated manifest file which is our targetFile
+    $targetContentsFile = $this->tmp.$this->shortName($this->targetFile);
+    Util::cmd('mv '.Util::esc($targetContentsFile).' '.Util::esc($this->itemDir), 'PRINT');    
+
+    // update _meta.xml 
+    ModifyXML::updateElem('source', $this->shortName($this->sourceFile),
+                          "{$this->identifier}_meta.xml", $this->tmp);        
+    ModifyXML::updateElem('identifier-torrent-infohash', $torrentHash,
+                          "{$this->identifier}_meta.xml", $this->tmp);        
+    ModifyXML::updateElem('identifier-torrent-name', $torrentName,
+                          "{$this->identifier}_meta.xml", $this->tmp);        
+                          
+    if (file_exists($this->targetFile)) {
+        $fg = new FormatGetter;
+        $lines = file($this->targetFile);
+        foreach ($lines as $line) {
+            $outFile = strtok($line, ',');
+            $outAbsPath = $this->itemDir.$outFile;
+            if (file_exists($outAbsPath)) {
                 $formatName = $fg->pickFormat($outFile);
                 $this->extraTarget($outFile, $formatName);
             } else {
                 // file in .torrent missing from download directory
-                // TODO: what's the preferred method to raise an exception here?
+                Util::cmd('echo MISSING FILE FROM TORRENT:' . Util::esc($outAbsPath), 'PRINT');
             }
-        }        
-        fclose($man_handle);    
+        }
     } else {  
         // manifest file missing
-        // TODO: what's the preferred method to raise an exception here?
+        Util::cmd('echo MISSING TARGET FILE: '.Util::esc($manifest), 'PRINT');
+        fatal('Target manifest for torrent missing: '.Util::esc($manifest));
     }
 
   }

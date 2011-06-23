@@ -44,6 +44,8 @@ except ImportError:
 
 decimal_match = re.compile('\d')
 
+# decoding support
+
 def bdecode(data):
     '''Main function to decode bencoded data'''
     chunks = list(data)
@@ -88,65 +90,7 @@ def _dechunk(chunks):
             line += chunks.pop()
         return line
 
-def pingTracker ( ahash ):
-    # return len( ahash)
-    #tracker = "http://inferno.demonoid.me:3393/"
-    tracker = "http://10.rarbg.com/"
-    surl = tracker + ("scrape?info_hash=%s" % ahash )
-    curllist = ['curl', '-s', surl]
-    p = subprocess.Popen( curllist, stderr = subprocess.STDOUT, stdout = subprocess.PIPE )
-    (res, err) = p.communicate()
-    exitcode = p.wait()
-    if exitcode == 0:
-        return res
-    else:
-        return ' - failed - '
-
-def plingTracker ( hashlist):
-    idx = 1
-    for ahash in hashlist:
-        rep = pingTracker( ahash )
-        print( '[%s] %s : %s ' % ( str(idx).zfill(3), ahash, rep ) )
-        idx = idx + 1
-
-
-def ByteToHex( byteStr ):
-    """
-    Convert a byte string to it's hex string representation e.g. for output.
-    """
-    
-    # Uses list comprehension which is a fractionally faster implementation than
-    # the alternative, more readable, implementation below
-    #   
-    #    hex = []
-    #    for aChar in byteStr:
-    #        hex.append( "%02X " % ord( aChar ) )
-    #
-    #    return ''.join( hex ).strip()        
-
-    return ''.join( [ "%02X" % ord( x ) for x in byteStr ] ).lower()
-
-def HexToByte( hexStr ):
-    """
-    Convert a string hex byte values into a byte string. The Hex Byte values may
-    or may not be space separated.
-    """
-    # The list comprehension implementation is fractionally slower in this case    
-    #
-    #    hexStr = ''.join( hexStr.split(" ") )
-    #    return ''.join( ["%c" % chr( int ( hexStr[i:i+2],16 ) ) \
-    #                                   for i in range(0, len( hexStr ), 2) ] )
- 
-    bytes = []
-
-    hexStr = ''.join( hexStr.split(" ").upper() )
-
-    for i in range(0, len(hexStr), 2):
-        bytes.append( chr( int (hexStr[i:i+2], 16 ) ) )
-
-    return ''.join( bytes )
-
-# Logging   
+# logging   
             
 def dlog ( lev, str ):
     global sout
@@ -193,10 +137,10 @@ def printable ( dirty ):
 #    return ''.join([char for char in clean if isprint(char)])
     return clean
 
-
+# core
     
 def parseTorrent( torrentFile ):
-    """Return a tuple with info_hash, files, and printable info for logging as a string ready for xmlrpc"""
+    """Return a tuple with torrent name, info hash, torrent files, and printable info for logging"""
     try: 
         with open( torrentFile, "rb") as f:
             metainfo = bdecode( f.read() )
@@ -421,14 +365,9 @@ def main(argv=None):
     global sout             # dlog prints to standard out as well
 
     global TEMP_DIR
-    global TORRENT_PATH 
     
     sout = False    
-        
-    # TODO read this out of an .ini
-    TORRENT_PATH = '/home/ximm/projects/bitty'
-    DEFAULT_TEMP_DIR = '/home/ximm/projects/bitty/tmp'
-    
+            
     if argv is None:
         argv = sys.argv
 
@@ -439,12 +378,9 @@ def main(argv=None):
     debug = False
 
     makeTempDir = True
-    TEMP_DIR = DEFAULT_TEMP_DIR    
-    logdir = "/home/ximm/projects/bitty/bitlogs/"
+    TEMP_DIR = '/tmp/' 
     
-    dlfn = None
-    
-    logmode = "a"
+    dlfn = None    
     
     for anArg in argv:
         if anArg[0] is "-":
@@ -460,21 +396,20 @@ def main(argv=None):
             elif "dir=" in qual:
                 makeTempDir = False
                 TEMP_DIR = qual.split("dir=")[-1]
-                if TEMP_DIR[-1] != "/":
-                    TEMP_DIR = TEMP_DIR + "/"
-                # logdir = TEMP_DIR                    
             elif "log=" in qual:
-                dlfn = logdir + qual.split("log=")[-1]
-                logmode = "a"
+                dlfn = qual.split("log=")[-1]
         else:
             torrentPath = anArg
             if '/' in torrentPath:
                 torrentFile = torrentPath.split('/')[-1]
             else:                
                 torrentFile = torrentPath
+    
+    if TEMP_DIR[-1] != "/":
+        TEMP_DIR = TEMP_DIR + "/"                    
 
     if dlfn is None:
-        dlfn = logdir + torrentFile + '.log'
+        dlfn = TEMP_DIR + torrentFile + '.log'
     
     if verbose is True:
         dloglevel = 2
@@ -484,11 +419,11 @@ def main(argv=None):
     if debug is True:
         dlogLevel = 3
     
-    with codecs.open( dlfn, encoding='utf-8', mode=logmode ) as dlogfile:
+    with codecs.open( dlfn, encoding='utf-8', mode="a" ) as dlogfile:
         if torrentFile is None:
             dlog(0, 'btget: (2) no torrent file specified, aborting')
             print 'btget: (2) no torrent file specified, aborting'
-            print 'Usage: btget torrentfile [-verbose] [-log=logfile] [-verbose] [-stdout]'  
+            print 'Usage: btget torrentfile [-verbose] [-dir=destination] [-log=logfile] [-verbose] [-stdout]'  
             return 2
         tup = parseTorrent ( torrentFile ) # returns none on Fails        
         if tup is None:
@@ -508,6 +443,8 @@ def main(argv=None):
                     dlog(0, "btget: (1) directory does not exist %s" % TEMP_DIR)
                     return 1
                 torrentDir = TEMP_DIR
+
+            dlog(2, "Torrent parse:\n%s" % torrentInfo )
             
             res = retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist, torrentDir )
             if res == 0:
