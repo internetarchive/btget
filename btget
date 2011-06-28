@@ -322,9 +322,11 @@ def transmissionTorrentState ( infoHash ):
 def transmissionCommand ( comlist ):
     # TODO:
     # credentials are currently hardcoded
-    ourlist = [ 'transmission-remote',
-                '-n',
-                'transmission:' ]
+    
+    ourlist = [ '/home/ximm/projects/bitty/transmission-remote']
+#    ourlist = [ 'transmission-remote',
+#                '-n',
+#                'transmission:' ]
 
     ourlist.extend( comlist )
     return shellCommand ( ourlist )

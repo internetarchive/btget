@@ -41,12 +41,22 @@ class Torrent extends Module
     // transmission-daemon needs write permission, it runs under debian-transmission by default :P
     Util::cmd('chmod ugo+w '.Util::esc($this->tmp), 'PRINT');    
     
-    // TODO: move script into petabox bin basket 
-    Util::cmd('/home/ximm/projects/bitty/btget -stdout '.Util::esc($this->sourceFile).' -dir='.Util::esc($this->tmp), 'PRINT');   
+    // DEBUG
+    Util::cmdPP('echo | whereis transmission-remote'); // last check still not installed on workers, so running out of /home/ximmm :P
+    // Util::cmdPP('echo | whereis transmission-daemon');
+    // push out the revised permissions in /home/ximm/petabox/etc/transmission-daemon/settings.json 
+    // Util::cmd('sudo cp /etc/transmission-daemon/settings.json /home/ximm/projects/bitty/bitlogs/default_settings.json', 'PRINT');
+    
+    // This is now hopefully unnecessary since Raj is pushing into /petabox/etc/transmission-daemon/settings.json to all workers
+    // Util::cmdPP('sudo cp /home/ximm/projects/bitty/bitlogs/settings.json /etc/transmission-daemon/settings.json');
+    Util::cmdPP('sudo /etc/init.d/transmission-daemon reload');
 
-    // seize ownership of downloaded files; may not be necessary in production environment, not sure what permissions 
-    // derive.php is executed with
-    Util::cmd('sudo chown -R ximm '.Util::esc($this->tmp), 'PRINT');        
+    // TODO: move script into petabox bin basket 
+    Util::cmd('/home/ximm/projects/bitty/btget -stdout -log=/home/ximm/projects/bitty/bitlogs/btgettest.log '.Util::esc($this->sourceFile).' -dir='.Util::esc($this->tmp), 'PRINT');   
+
+    // seize ownership of downloaded files; may not be necessary in worker environment, not sure what user 
+    //  derive.php is executed under
+    // Util::cmd('sudo chown -R ximm '.Util::esc($this->tmp), 'PRINT');        
     Util::cmd('sudo chmod ugo+w '.Util::esc($this->tmp).'*', 'PRINT');
     
     // in addition to the manifest, I generate a disposable helper file including:
@@ -58,7 +68,7 @@ class Torrent extends Module
         $torrentHash = strtok($lines[0], "\n");
         $torrentName = strtok($lines[1], "\n");
     } else {
-        Util::cmd('echo MISSING HASH FILE:'. Util::esc($targetHashFile), 'PRINT');
+        Util::cmdPP('echo MISSING HASH FILE:'. Util::esc($targetHashFile) );
     }
     
     // torrent contents are in $this->tmp/$torrentName/... while moving eliminate the intermediate dir $torrentName
@@ -89,12 +99,12 @@ class Torrent extends Module
                 $this->extraTarget($outFile, $formatName);
             } else {
                 // file in .torrent missing from download directory
-                Util::cmd('echo MISSING FILE FROM TORRENT:' . Util::esc($outAbsPath), 'PRINT');
+                Util::cmdPP('echo MISSING FILE FROM TORRENT:' . Util::esc($outAbsPath) );
             }
         }
     } else {  
         // manifest file missing
-        Util::cmd('echo MISSING TARGET FILE: '.Util::esc($manifest), 'PRINT');
+        Util::cmdPP('echo MISSING TARGET FILE: '.Util::esc($manifest) );
         fatal('Target manifest for torrent missing: '.Util::esc($manifest));
     }
 
