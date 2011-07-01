@@ -1,21 +1,24 @@
 #!/usr/bin/env python
 
-# requires: transmission-daemon and transmission-remote
-# assumes transmission-daemon is listening for rpc on host port 9091
+# REQUIRES:
+#  transmission-daemon and transmission-remote
+#  transmission-daemon listening for rpc on port 9091
 
 # usage:
 #   btget filename.torrent -dir=tempdir
-# note: tempdir must have ugo+w so debian-transmission can write to it
+
+# NOTES:
+#  tempdir must have ugo+w so debian-transmission can write to it
+#  transmissionCredentials are currently hardcoded
 
 # TODO:
+#  Change default behavior of no log fn provided to mean no logging
 #  Add mutable transmission-remote rpc authentication credentials and port 
+#  How to handle UTF chars in torrent filenames?
+#  State machine still brittle if we are trying to start an existing torrent
 #  Add seed/leech ratio management so we maintain at least parity
-#   checking up/down speeds, etc.
-#  Check seeds for torrents; retry logic? How long do we keep at a torrent?
-#  session management: we need to be able to save/resume when machine goes down
-#  torrent file name and content file names can be nonconfirming in all sort of terrible ways... strategy? :O
-#  when torrent path consists of subdirectory, not sure 
-# NOTES:
+#  Check for seeds for torrents; retry logic? How long do we keep at a torrent?
+
 
 import io
 import os
@@ -30,11 +33,15 @@ import subprocess
 import datetime
 import codecs
 import re
-import bencode
 import pprint
 import urllib
 import hashlib
 import StringIO
+import random
+
+sys.path.append("/petabox/sw/lib/python")
+sys.path.append("/home/ximm/projects/bitty/")   # only needed until module pi'd to workers
+import bencode      # in /petabox/sw/lib/python/
 
 try:
     import psyco # Optional, 2.5x improvement in speed
@@ -147,7 +154,23 @@ def parseTorrent( torrentFile ):
                 
         info = metainfo['info']
 
-        fils = info['files']
+        if 'files' in info:
+            fils = info['files']
+            # screen file names for malicious/corrupt content
+            # very basic screening: currently look for ..
+            # not checking for inclusion of .., 'this was too long....mp3' is legal
+            for aFile in fils:
+                fp = aFile[ 'path' ]
+                for aNode in fp:
+                    if aNode == '..' or '/' in aNode:
+                        raise ValueError
+        else:
+            # special handling for case of single-file torrents
+            # construct data strutures to mimic standard multi-file case
+            oneFile = {}
+            oneFile[ 'path' ]= [ info[ 'name' ] ]
+            oneFile[ 'length' ]= info[ 'length' ]
+            fils = [ oneFile ]
         
         encodedInfo = bencode.bencode(info)
         infoHash = hashlib.sha1(encodedInfo).hexdigest().upper()
@@ -164,7 +187,11 @@ def parseTorrent( torrentFile ):
         torrentInfo = '%s\nSHA1 info_hash: %s' % (tmpStream.getvalue(), infoHash )
 
         torrentName = info['name']
-        
+        # a subdirectory with this name automatically created by transmission (by default)
+        # so do a cursory check for malice
+        if torrentName == '..' or '/' in torrentName:
+            raise ValueError        
+
         return ( torrentName, infoHash, fils, torrentInfo )
 
     except:
@@ -205,27 +232,21 @@ def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist,
         comlist = ['--add', torrentPath ]
         comCode, res, err = transmissionCommand (comlist)
         resp = findResp ( res )
+        dlog(2, 'Response: %s' % resp )
         if resp != '"success"' and resp != '"duplicate torrent"':
             dlog (1, 'FAILED: could not load %s, exitcode %s\n%s\n%s' % (torrentPath, comCode, res, err ) )
             return 1       
 
-        # TODO: use Hank's technique for adding to metadata in Torrent.php
-        # write the infohash for the file
+        # write the infohash for the file (Torrent.php will use to add metadata)
         hashFile = '%s/%shash' % ( torrentDir, torrentFile ) 
         with codecs.open( hashFile, encoding='utf-8', mode="w" ) as cfile:
             cfile.write('%s\n%s\n' % ( infoHash, torrentName ) )
               
-        # write the list of retrieved files to .torrentcontents
-        contFile = '%s/%scontents' % ( torrentDir, torrentFile ) 
         dlsize = 0
-        with codecs.open( contFile, encoding='utf-8', mode="w" ) as cfile:
-            for aFile in filelist:
-                # path is array expressing a dir path, last of which is fn
-                #  c.f. http://www.bittorrent.org/beps/bep_0003.html
-                fn = '/'.join( aFile['path'] )
-                fs = aFile['length']
-                dlsize = dlsize + int(fs)
-                cfile.write ('%s,%s\n' % (fn, fs) )
+        for aFile in filelist:
+            fs = aFile['length']
+            dlsize = dlsize + int(fs)
+
         dlsizeK = dlsize / 1024
         dlsizeMB = dlsizeK / 1024
         dlog (1, 'Downloading %s MB' % dlsizeMB )    
@@ -256,7 +277,12 @@ def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist,
             if error != 'None':
                 dlog( 1, 'ERROR: %s' % error )                
             finished = True
+        elif state == '(None)':
+            dlog( 1, 'Torrent missing, may have been manually removed' )
+            finished = True            
         else:
+            # wait a bit
+            # fugly logging logic... sorry <ducks>
             time.sleep(60)
             mins = mins + 1
             if mins < 15:
@@ -287,6 +313,98 @@ def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist,
         return 0    
     else:
         return 1
+
+def writeManifest ( torrentDir, torrentFile, filelist, fixFilenames ):
+    """ write the list of retrieved files to .torrentcontents
+    since we're walking the files, scan each path and return a dict mapping all path elements to sanitized versions of each """
+    repDict = {}
+    dirtyPathLists = []
+    if '.torrent' in torrentFile:
+        basename = torrentFile.split('.torrent')[0]
+    else:
+        basename = torrentFile
+    contFile = '%s/%s_torrent.tlg' % ( torrentDir, basename ) 
+    with codecs.open( contFile, encoding='utf-8', mode="w" ) as cfile:
+        for aFile in filelist:
+            # path is array expressing a dir path, last of which is fn
+            #  c.f. http://www.bittorrent.org/beps/bep_0003.html
+            fsize = aFile['length']
+            dirtyPathList = aFile['path']
+            dirtyPathLists.append( dirtyPathList )
+            dirtyPath = '/'.join( dirtyPathList )
+            cleanPath = ''
+            for dirtyPart in dirtyPathList:
+                cleanPart = sanitizeFilename ( dirtyPart, repDict )
+                cleanPath = cleanPath + cleanPart
+            if fixFilenames is True:
+                cfile.write ('%s,%s,%s\n' % (dirtyPath, cleanPath, fsize ) )
+            else:
+                cfile.write ('%s,%s,%s\n' % (dirtyPath, dirtyPath, fsize ) )            
+    return (dirtyPathLists, repDict)
+
+def sanitizeFilename ( dirty, repDict ):
+    """Return a file or directory name that has no spaces or punctuation, length-limited""" 
+    # NOTE: operates on parts, not on a full path!
+    # TODO: test for illegal file names on Windows? e.g. COM1 or NUL...
+    if dirty in repDict:
+        return repDict[ dirty]
+    validchars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+    validchars = frozenset( validchars )
+    clean = ''.join(c for c in dirty.replace(' ','_').strip() if c in validchars)
+    if len(clean) == 0:
+        # the way split works on paths, it's possible we were passed an empty string
+        if len(dirty) != 0:
+            return 'generated_filename_%s' % random.randint(1000,9999)
+    if len(clean) > 128:
+        return '%s%s' % ( clean[0:124], random.randint(1000,9999) )
+    repDict[ dirty] = clean
+    return clean
+
+def buildRepDict( dirtyPaths ):
+    repDict = {}
+    for aPath in dirtyPaths:
+        if '/' in aPath:        
+            pathList = aPath.split( '/' )
+            for aPart in pathList[:]:
+                sanitizeFilename ( aPart, repDict )
+        else:
+            sanitizeFilename ( aPath, repDict )
+    return repDict
+
+def mvWithDict ( torrentDir, dirtyPathLists, repDict ):
+    """Traverse dirtyPaths recursively, renaming every file acccording to repDict"""
+    dlog(0, "btget: sanitizing directories and files..." )
+    for aDirtyPathList in dirtyPathLists:
+
+        recursivelyRename( torrentDir, aDirtyPathList[:], repDict )
+
+def recursivelyRename( prefixPath, pathList, repDict ):
+    """Use mv to rename the top of each directory, then move inward.
+    Works since the renamed prefixing path is passed in..."""
+    tophere = pathList[0]
+    newtop = repDict[ tophere ]
+    if tophere != newtop:
+        src = '%s%s' % (prefixPath, tophere)
+        trg = '%s%s' % (prefixPath, newtop) 
+        dlog(1, 'Considering renaming %s as %s' % (src, trg) )    
+        if os.access( ('%s%s' % (prefixPath, tophere)), os.F_OK ) is True:
+            try:
+                os.rename(src,trg)
+                dlog(1, 'SUCCESS: renamed!' )
+            except OSError as (errno, strerror):
+                dlog(1, 'FAILED: (%s) %s' % (errno, strerror ) )   
+    #            comlist = ['mv', src, trg ]
+    #            dlog(1, ' '.join(comlist) )
+    #            (exitcode, res, err) = shellCommand( comlist )
+    #            dlog(1, 'exitcode: %s\nerr: %s\n%s' % (exitcode, err, res) )
+        else:
+            dlog(1, 'SKIPPING: already renamed' )    
+    else:
+        dlog(1, 'SKIPPING: do not need to rename %s' % (tophere) )
+    if len( pathList ) > 1:
+        prefixPath = prefixPath + newtop + '/'
+        recursivelyRename( prefixPath, pathList[1:], repDict )
+
 
 # Helpers
 
@@ -320,19 +438,23 @@ def transmissionTorrentState ( infoHash ):
     return transmissionCommand ( comlist )
         
 def transmissionCommand ( comlist ):
-    # TODO:
-    # credentials are currently hardcoded
-    
-    ourlist = [ '/home/ximm/projects/bitty/transmission-remote']
-#    ourlist = [ 'transmission-remote',
-#                '-n',
-#                'transmission:' ]
+    global transmissionCredentials
+
+    ourlist = [ 'transmission-remote',
+                '-n',
+                transmissionCredentials ]
 
     ourlist.extend( comlist )
     return shellCommand ( ourlist )
 
 def shellCommand ( comlist ):
-    comstring = ' '.join( comlist )
+    global transmissionCredentials
+    # abominable hack to hide credentials in log :P
+    safelist = comlist[:]
+    if transmissionCredentials in safelist:
+        idx = safelist.index( transmissionCredentials )
+        safelist[idx] = 'xxxxxxx:xxxxxxx'
+    comstring = ' '.join( safelist )
     dlog( 2, comstring )
     p = subprocess.Popen( comlist, stderr = subprocess.STDOUT, stdout = subprocess.PIPE )
     (res, err) = p.communicate()
@@ -345,8 +467,8 @@ def tempDirForTorrent( infoHash ):
     
     torrentDir = '%s/%s/' % (TEMP_DIR, infoHash )
     if os.access( torrentDir, os.F_OK ) is False:
-        os.mkdir( torrentDir )
         dlog( 2, 'Making item directory %s' % torrentDir )
+        os.mkdir( torrentDir )
     else:
         dlog( 2, 'Found existing item directory %s' % torrentDir )
     return torrentDir
@@ -368,6 +490,8 @@ def main(argv=None):
 
     global TEMP_DIR
     
+    global transmissionCredentials
+        
     sout = False    
             
     if argv is None:
@@ -378,12 +502,13 @@ def main(argv=None):
     dryrun = False
     verbose = False
     debug = False
+    fixFilenames = False
 
     makeTempDir = True
     TEMP_DIR = '/tmp/' 
     
     dlfn = None    
-    
+        
     for anArg in argv:
         if anArg[0] is "-":
             qual = anArg[1:len(anArg)]
@@ -395,6 +520,8 @@ def main(argv=None):
                 verbose = True
             elif qual == "stdout":
                 sout = True
+            elif qual == "sanitize":
+                fixFilenames = True
             elif "dir=" in qual:
                 makeTempDir = False
                 TEMP_DIR = qual.split("dir=")[-1]
@@ -420,12 +547,14 @@ def main(argv=None):
     
     if debug is True:
         dlogLevel = 3
+
+    transmissionCredentials = 'archive:BigData300'
     
     with codecs.open( dlfn, encoding='utf-8', mode="a" ) as dlogfile:
         if torrentFile is None:
             dlog(0, 'btget: (2) no torrent file specified, aborting')
             print 'btget: (2) no torrent file specified, aborting'
-            print 'Usage: btget torrentfile [-verbose] [-dir=destination] [-log=logfile] [-verbose] [-stdout]'  
+            print 'Usage: btget torrentfile [-verbose] [-dir=destination] [-log=logfile] [-verbose] [-stdout] [-sanitize]'  
             return 2
         tup = parseTorrent ( torrentFile ) # returns none on Fails        
         if tup is None:
@@ -449,8 +578,13 @@ def main(argv=None):
             dlog(2, "Torrent parse:\n%s" % torrentInfo )
             
             res = retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist, torrentDir )
-            if res == 0:
-                dlog(1, "btget: (0) retrieved %s" % torrentFile)
+            if res == 0:                
+                (dirtyPathLists, repDict) = writeManifest ( torrentDir, torrentFile, filelist, fixFilenames )
+                if fixFilenames is True:
+                    # by default transmission stores torrents in the subdir suggested by the name field (per bittorrent convention)
+                    saveDir = '%s%s/' % (torrentDir, torrentName)
+                    mvWithDict ( saveDir, dirtyPathLists, repDict )
+                dlog(0, "btget: (0) retrieved %s" % torrentFile)
                 return 0
             elif res == 2:
                 dlog(0, "btget: (1) problem with torrent file %s" % torrentFile)
