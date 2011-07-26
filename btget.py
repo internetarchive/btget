@@ -1,27 +1,30 @@
 #!/usr/bin/env python
 
+# usage:
+#   btget foo.torrent [-rpc-port=x] [-peer-port=y] [-dir=d] [-stdout] [-verbose]
+# note:
+#   port settings are advisory, if daemon cannot start, other ports will be found
+
 # REQUIRES:
 #  transmission-daemon and transmission-remote
+
+# SUBPROCESSES:
 #  transmission-daemon 
 #       listening for rpc on RPC_PORT (default 9091)
 #       taking peer requests on PEER_PORT (default 51413)
 
-# usage:
-#   btget foo.torrent rpc-port=aport peer-port=difport -dir=tempdir
-
 # NOTES:
-#  tempdir must have ugo+w so debian-transmission can write to it
+#  hard-coded to only try range 9091 and following 25 ports for RPC
+#  tempdir might need write perms so daemon (debian-transmission) can write to it
+#   ...but since daemon now runs in our process group, it could inherit them
 #  transmissionCredentials are currently hardcoded
-#  currently transitioning to manually starting transmission-daemon for each .torrent
 
 # TODO:
-#  When polling extract seed count, log it, and stash max in hash file for metadata
 #  Add mutable transmission-remote rpc authentication credentials and port 
 #  How to handle UTF chars in torrent filenames?
 #  State machine still brittle when trying to start a torrent already loaded in transmission-d
-#  Add seed/leech ratio management so we maintain at least parity
-#  Check for seeds for torrents; retry logic? How long do we keep at a torrent?
 
+#  Add seed/leech ratio management so we maintain at least parity
 
 import io
 import os
@@ -41,6 +44,7 @@ import urllib
 import hashlib
 import StringIO
 import random
+import signal
 
 sys.path.append("/petabox/sw/lib/python")
 # sys.path.append("/home/ximm/projects/bitty/")   # only needed until module pi'd to workers
@@ -55,6 +59,9 @@ except ImportError:
 decimal_match = re.compile('\d')
 
 # decoding support
+
+def version():
+    return '$Revision: 37286 $ $Date: 2011-07-26 01:12:06 +0000 (Tue, 26 Jul 2011) $'
 
 def bdecode(data):
     '''Main function to decode bencoded data'''
@@ -176,7 +183,7 @@ def parseTorrent( torrentFile ):
             fils = [ oneFile ]
         
         encodedInfo = bencode.bencode(info)
-        infoHash = hashlib.sha1(encodedInfo).hexdigest().upper()
+        infoHash = hashlib.sha1(encodedInfo).hexdigest() # .upper()
     
         tmpStream = StringIO.StringIO()        
     
@@ -204,15 +211,13 @@ def parseTorrent( torrentFile ):
 
 def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist, torrentDir ):
     """Use an instance of transmission-daemon via transmission-remote to retrieve one .torrent"""
-    global RPC_PORT
-    global PEER_PORT
 
     dlog (1, 'Retrieving %s into %s' % ( torrentPath, torrentDir) )
     
-    # TODO: check overall torrent status:
-    #   seeding OK? up/download speeds OK? etc.
-
-    # dlog (1, 'Starting daemon, RPC port %s peer port %s' % ( RPC_PORT, PEER_PORT ) )    
+    ( daemonShellProcess, daemonPID ) = getDaemon()
+    if daemonShellProcess == None:
+        dlog (1, 'FAILED: could not start daemon' )
+        return 1
 
     startTorrent = True
 
@@ -239,11 +244,13 @@ def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist,
                     '--download-dir',
                     torrentDir ]
         ret = transmissionCommand (comlist)
-        
+        dlog(2, 'transmission-remote... %s' % ( ' '.join( comlist ) ) )
+                
         # torrent path/fn provided must be fully qualified if not in ~
         comlist = ['--add', torrentPath ]
         comCode, res, err = transmissionCommand (comlist)
         resp = findResp ( res )
+        dlog(2, 'transmission-remote... %s' % ( ' '.join( comlist ) ) )
         dlog(2, 'Response: %s' % resp )
         if resp != '"success"' and resp != '"duplicate torrent"':
             dlog (1, 'FAILED: could not load %s, exitcode %s\n%s\n%s' % (torrentPath, comCode, res, err ) )
@@ -261,7 +268,7 @@ def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist,
 
         dlsizeK = dlsize / 1024.0
         dlsizeMB = dlsizeK / 1024.0
-        dlog (1, 'Downloading %s MB' % dlsizeMB )    
+        dlog (1, 'Downloading %s MB' % round( dlsizeMB, 2) )    
 
     # wait for completion...
     # TODO build a better state machine
@@ -276,8 +283,13 @@ def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist,
     maxPeers = 0
 
     while finished is False:
+        # clear out buffers for the daemonShellProcess
+        try:
+            bitbucket = daemonShellProcess.stdout.flush()
+        except:
+            bitbucket = None
         if giveUpP ( infoHash, mins ) is True:
-            dlog( 1, '\nDownload abandoned after %s minutes.' % min )
+            dlog( 1, '\nDownload abandoned after %s minutes.' % mins )
             finished = True
         comCode, res, err = transmissionTorrentState ( infoHash )
         state = findState( res )
@@ -296,7 +308,7 @@ def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist,
                 dlog( 1, 'ERROR: %s' % error )                
             finished = True
         elif state == '(None)':
-            dlog( 1, 'Torrent missing, may have been manually removed' )
+            dlog( 1, 'Torrent missing, may have been manually removed (or daemon killed)' )
             finished = True            
         # wait a bit
         # fugly logging logic... sorry <ducks>
@@ -333,24 +345,130 @@ def retrieveTorrent ( torrentPath, torrentFile, torrentName, infoHash, filelist,
 
     dlog (1, 'PEAK SPEED (PEERS): ^ %s (%s), v %s (%s); PEAK PEERS: %s' % (maxUp,maxUpPeers,maxDown,maxDownPeers,maxPeers) )
 
-    # remove the torrent from seeding/download list
-    # note that rtorrent deleted the 'tied' .torrent file, that's why we work on a copy
     # TODO: maintain seeding ratio by keeping alive until ratio reached
     #  issue: what if no one is interested...? :P  
+
+    # remove the torrent from seeding/download list
     comlist = ['--torrent', infoHash, '--remove' ]
     comCode, res, err = transmissionCommand (comlist)
-    dlog (1, 'Removing torrent from daemon (if necessary)')
-    
-    # NOTE: now doing this in Torrent.php
-    # finally, move the original torrent file into the downloaded directory
-    # comlist = ['mv', torrentPath, ('%s.' % torrentDir ) ]
-    # ret = shellCommand (comlist)
+    dlog (1, 'Removing torrent from daemon if necessary...')
+
+    dlog (1, 'Terminating daemon...')        
+    os.kill( daemonShellProcess.pid, signal.SIGTERM )
+    if daemonPID != 0:
+        os.kill( daemonPID, signal.SIGTERM )
+    daemonShellProcess = None
     
     if success is True:
         return 0    
     else:
         return 1
 
+
+def getDaemon():
+    """Try to find an open RPC and PEER port pairing and instantiate a daemon on them
+    Return (None, 0) if no daemon created, or, ( shellSubprocess, PID ) to kill after torrent retrieval
+    Two kills are required: one for the shell, one for the daemon"""
+    global RPC_PORT
+    global PEER_PORT
+    global transmissionCredentials
+
+    # maintain a fixed port relationship
+    offset = 51413 - 9091
+        
+    # verify that transmission-d is installed first...(!)
+    
+    finishedLooking = False
+
+    dlog (1, 'Trying to instantiate a new instance of transmission-daemon on an unused port pair...' )            
+
+    daemonShellProcess = None
+
+    # DEBUG    
+    numLeftToTry = 25
+    
+    while finishedLooking is False:    
+        # Launch a daemon with a given set of ports, then scan its verbose debugging output checking for the strings
+        # that uniquely indicate that it tried, and failed, to bind to the requested RPC control port RPC_PORT:
+        #  [18:43:59.582] Couldn't bind port 52000 on 0.0.0.0: Address already in use (Is another copy of Transmission already running?) (net.c:369)
+        # If we reach the succeeding line loading settings, binding was successful:
+        #  [18:43:59.582] Using settings from "/home/ximm/.config/transmission-daemon" (daemon.c:425)
+        PEER_PORT = RPC_PORT + offset            
+        dlog (1, 'Starting daemon with RPC port %s, peer port %s' % ( RPC_PORT, PEER_PORT ) )            
+        comstr = "bash -c 'echo DaemonPID: $$; exec transmission-daemon --config-dir /etc/transmission-daemon --port %s --peerport %s --foreground 2>&1'" % ( str( RPC_PORT ), str( PEER_PORT ) )
+        dlog (1, 'Command: %s' % comstr )
+
+        # NOTE: uses shell=True so quoting of exec works... sorry, Sam! <ducks>
+        # NOTE: do not use preexec_fn=os.setsid in Popen, as the process is then not killed if btget is (or errs)
+        daemonShellProcess = subprocess.Popen(   comstr,
+                                            shell = True,
+                                            stderr = subprocess.STDOUT,
+                                            stdout = subprocess.PIPE ) 
+
+        tout = 0
+        gotStatus = False
+        daemonOK = False
+        daemonPID = 0
+        while gotStatus is False:
+            # TK risk of blocking here in readline()... solutions are tricky
+            #  could use pexpect or equivalent; or one of the solutions here:
+            #  http://stackoverflow.com/questions/375427/non-blocking-read-on-a-subprocess-pipe-in-python
+            aline = daemonShellProcess.stdout.readline().strip()
+            dlog (1, '  %s' % aline )
+            if 'DaemonPID' in aline:
+                daemonPID = int ( aline.partition( 'DaemonPID: ' )[-1] )
+            if 'command not found' in aline or 'Permission denied' in aline:
+                # problem with transmission-d, abort rather than blocking
+                dlog (1, 'FAILED: uhandled exception: %s' % aline )            
+                gotStatus = True
+            if 'bind' in aline:
+                # Assume line is 'Couldn't bind port...' which means port taken
+                dlog (1, 'FAILED: port(s) appear taken ( %s seconds )' % tout )            
+                gotStatus = True
+            elif 'Using settings' in aline:
+                # This line always comes after bind attempt; must be success
+                dlog (1, 'SUCCESS: port(s) appear free ( %s seconds )' % tout )            
+                daemonOK = True
+                gotStatus = True
+            if tout > 60:
+                # 60 seconds, and no reply? Should have gotten SOMETHING. Abort!
+                gotStatus = True
+            tout = tout + 0.25
+            time.sleep(0.25)
+        
+        if daemonOK is True:
+            # apparently we have a usable daemon attached to daemonShellProcess
+            # verify we can talk to it using transmission-remote on the expected port
+            comlist = ['--session-info' ] 
+            comCode, res, err = transmissionCommand ( comlist )
+            if res is not None and res !='':
+                dlog (1, 'Verified communication with daemon, --session-info returns:\n%s' % res )            
+                finishedLooking = True
+            elif err is not None and err !='':
+                dlog (1, 'Problem communicating with daemon, --session-info returns:\n%s' % err )            
+
+        if finishedLooking is False:        
+            dlog (1, 'Terminating unusable daemon...' )
+            # two processes to kill: the shell (daemonShellProcess.pid) and the daemon (reported by echo)
+            # we could use killpg and setsid, but that forks that group and it is not killed if btget is
+            os.kill( daemonShellProcess.pid, signal.SIGTERM )
+            if daemonPID != 0:
+                os.kill( daemonPID, signal.SIGTERM )
+            daemonShellProcess = None
+
+            # try next port
+            RPC_PORT = RPC_PORT + 1
+            numLeftToTry = numLeftToTry - 1
+            if numLeftToTry == 0 or PEER_PORT > 62000:
+                dlog (1, 'ABORT: failed to find open ports' )            
+                finishedLooking = True
+                
+    if daemonShellProcess is not None:
+        dlog (1, 'Using transmission-daemon on rpc port %s' % RPC_PORT )                    
+
+    return ( daemonShellProcess, daemonPID )
+    
+    
 def writeManifest ( torrentDir, torrentFile, filelist, fixFilenames ):
     """ write the list of retrieved files to .torrentcontents
     since we're walking the files, scan each path and return a dict mapping all path elements to sanitized versions of each """
@@ -375,9 +493,10 @@ def writeManifest ( torrentDir, torrentFile, filelist, fixFilenames ):
                 cleanPathList.append( cleanPart )
             cleanPath = '/'.join( cleanPathList )     
             if fixFilenames is True:
-                cfile.write ('%s,%s,%s\n' % (dirtyPath, cleanPath, fsize ) )
+                cfile.write ('%s,%s,%s\n' % (cleanPath, fsize, dirtyPath ) )
             else:
-                cfile.write ('%s,%s,%s\n' % (dirtyPath, dirtyPath, fsize ) )            
+                # if dirty path contains commas (can happen!) parsing will break horribly
+                cfile.write ('%s,%s,%s\n' % (dirtyPath, fsize, dirtyPath ) )            
     return (dirtyPathLists, repDict)
 
 def sanitizeFilename ( dirty, repDict ):
@@ -385,10 +504,12 @@ def sanitizeFilename ( dirty, repDict ):
     # NOTE: operates on parts, not on a full path!
     # TODO: test for illegal file names on Windows? e.g. COM1 or NUL...
     if dirty in repDict:
-        return repDict[ dirty]
+        return repDict[ dirty ]
+    # this could in theory be done via string.translate()
+    lessdirty = dirty.replace(' ','_').replace('[','(').replace(']',')').replace('{','(').replace('}',')')    
     validchars = "-_.() %s%s" % (string.ascii_letters, string.digits)
     validchars = frozenset( validchars )
-    clean = ''.join(c for c in dirty.replace(' ','_').strip() if c in validchars)
+    clean = ''.join(c for c in lessdirty.strip() if c in validchars)
     if len(clean) == 0:
         # the way split works on paths, it's possible we were passed an empty string
         if len(dirty) != 0:
@@ -466,6 +587,7 @@ def findError ( stringOfLines ):
         
 def findVal ( keytext, stringOfLines ):
     try:
+        # note: attempt to access a result via index -1 will raise exception if not found
         theLine =  [l for l in stringOfLines.splitlines() if (keytext in l)][-1]
         theVal = theLine.split( keytext )[-1].strip()
         return theVal
@@ -477,10 +599,13 @@ def transmissionTorrentState ( infoHash ):
     return transmissionCommand ( comlist )
         
 def transmissionCommand ( comlist ):
-    global transmissionCredentials
     global RPC_PORT
+    return transmissionCommandOnPort ( comlist, RPC_PORT )
+    
+def transmissionCommandOnPort ( comlist, rpcport ):
+    global transmissionCredentials
     ourlist = [ 'transmission-remote',
-                str(RPC_PORT),
+                str( rpcport ),
                 '--auth',
                 transmissionCredentials ]
 
